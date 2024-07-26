@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+
+# @Filename: git-submodule-fast
+# @Author:   Ben Sokol
+# @Email:    ben@bensokol.com
+#
+# Copyright (C) 2019 by Ben Sokol. All Rights Reserved.
+
+import argparse
+import enum
+import logging
+import os
+import subprocess
+import sys
+
+log = None
+
+class STATUS(enum.Enum):
+    success = 0
+    not_git_repo = 1
+    unmerged_changes = 2
+    not_initialized = 3
+    unable_to_checkout = 4
+    unknown = 100
+
+
+class GitSubmoduleUpdateLogging():
+    class ArgparseAction(argparse._StoreConstAction):
+        def __init__(self, option_strings, dest, default=logging.INFO, required=False, help=None):
+            super(GitSubmoduleUpdateLogging.ArgparseAction, self).__init__( option_strings=option_strings, dest=dest, const=logging.DEBUG, default=default, required=required, help=help)
+
+    class logging_formatter( logging.Formatter ):
+        BASE_FORMAT = '%(levelname)s: %(message)s'
+        INFO_FORMAT = '%(message)s'
+        FILE_FORMAT = '%(file)s(%(line)s): '
+        def format( self, record ):
+            if 'file' in record.__dict__: self._fmt = self.FILE_FORMAT
+            else: self._fmt = ''
+            if record.levelno == logging.INFO: self._fmt += self.INFO_FORMAT
+            else: self._fmt += self.BASE_FORMAT
+            return( logging.Formatter.format( self, record ) )
+
+    class stdout_filter( logging.Filter ):
+        def filter( self, record ):
+            if record.levelno > logging.WARNING: return False
+            else: return True
+
+    def __init__(self, debug_level):
+        global log
+        self.logger = logging.getLogger(__name__)
+        formatter = self.logging_formatter()
+        out_stream = logging.StreamHandler( sys.stdout )
+        err_stream = logging.StreamHandler( sys.stderr )
+        out_stream.addFilter( self.stdout_filter() )
+        out_stream.setFormatter( formatter )
+        err_stream.setFormatter( formatter )
+        out_stream.setLevel( debug_level )
+        err_stream.setLevel( logging.ERROR )
+        self.logger.addHandler( out_stream )
+        self.logger.addHandler( err_stream )
+        self.logger.setLevel( debug_level )
+        log = self.logger
+
+
+class Timing():
+    def __init__(self, enabled, total_name):
+        self.enabled = enabled
+        self.times = {}
+        self.total_name = total_name
+        import time
+        self.module_time = time
+        self.module_datetime = None
+
+    def start(self, name):
+        if self.enabled:
+            self.times[name] = {}
+            self.times[name]['start'] = self.module_time.time()
+
+    def end(self, name):
+        if self.enabled:
+            if name not in self.times:
+                raise RuntimeError(name + " is not in self.times.")
+            self.times[name]['end'] = self.module_time.time()
+
+    def __format(self, start, end, dec=2):
+        if self.module_datetime is None:
+            import datetime
+            self.module_datetime = datetime
+        ret = ""
+        seconds = round(self.module_datetime.timedelta(seconds=(end - start)).total_seconds(), dec)
+        struct = self.module_time.gmtime(seconds)
+        while seconds > 60:
+            seconds -= 60
+        seconds = round(seconds, dec)
+        if struct.tm_hour > 0:
+            ret += str(struct.tm_hour) + " hour"
+            ret += "s, " if struct.tm_hour > 1 else ", "
+        if struct.tm_min > 0:
+            ret += str(struct.tm_min) + " minute"
+            ret += "s, " if struct.tm_min > 1 else ", "
+        ret += str(seconds).ljust(4, "0") + " seconds"
+        return ret
+
+    def print(self, newline_before_total=True):
+        if self.enabled:
+            log.info("\nTiming:")
+            print_list = []
+            just = 0
+            root_start = None
+            root_end = None
+            for name, data in self.times.items():
+                if 'start' not in data or 'end' not in data:
+                    continue
+                if data['start'] is None or data['end'] is None:
+                    continue
+                if name == self.total_name:
+                    root_start = data['start']
+                    root_end = data['end']
+                else:
+                    formatted_name = name.replace(self.total_name, '') + ": "
+                    just = max(just, len(formatted_name))
+                    print_list.append((formatted_name, self.__format(data['start'], data['end'])))
+            for item in print_list:
+                log.info("  " + item[0].ljust(just) + item[1])
+            if root_start is not None and root_end is not None:
+                if len(print_list) > 0 and newline_before_total:
+                    log.info("")
+                log.info("  Total: " + self.__format(root_start, root_end))
+
+    def print_total(self):
+        if self.enabled:
+            root_start = None
+            root_end = None
+            for name, data in self.times.items():
+                if 'start' not in data or 'end' not in data:
+                    continue
+                if data['start'] is None or data['end'] is None:
+                    continue
+                if name == self.total_name:
+                    root_start = data['start']
+                    root_end = data['end']
+                    break
+            log.info("Time: " + self.__format(root_start, root_end))
+
+
+class GitSubmoduleUpdate():
+    def __init__(self, args):
+        self.init = args.init
+        self.recursive = args.recursive
+        self.display_timing = args.time
+        self.display_timing_total_only = args.time_total
+        self.noexec = args.noexec
+        self.threads = args.threads
+        self.results = args.results
+
+        log.debug("Using " + str(self.threads) + " threads.")
+        self.status = STATUS.success
+        self.initialized = False
+        self.exiting = False
+        self.executor = None
+        if self.threads > 1:
+            import concurrent.futures
+            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.threads)
+
+        self.data_total = 0
+        self.data_updated = 0
+        self.data_already_uptodate = 0
+        self.data_initialized = 0
+        self.data_skipped = 0
+        self.data_errors = 0
+
+
+    def __del__(self):
+        try:
+            self.executor.shutdown()
+        except:
+            self.status = STATUS.unkown
+
+
+    def setup(self):
+        '''Setup. Call before run.'''
+        self.__locate_git_directory()
+        self.timing = Timing(enabled=self.display_timing or self.display_timing_total_only, total_name=self.git_root)
+        return self.status == STATUS.success
+
+
+    def run(self):
+        '''Run GitSubmoduleUpdate'''
+        log.debug("Starting GitSubmoduleUpdate")
+        if not self.initialized:
+            raise RuntimeError("setup must be complete before run is called.")
+
+        if self.init:
+            self.timing.start('init all')
+            if not self.noexec:
+                subprocess.check_call(["git", "submodule", "init"])
+            self.timing.end('init all')
+
+        self.timing.start(self.git_root)
+        try:
+            self.__recursive_update(self.git_root)
+        except KeyboardInterrupt:
+            self.exiting = True
+        if self.executor is not None:
+            self.executor.shutdown()
+        self.timing.end(self.git_root)
+
+        log.debug("Finished GitSubmoduleUpdate")
+        if self.results:
+            log.info("Results:")
+            if self.data_updated > 0: log.info("  Updated: " + str(self.data_updated))
+            if self.data_already_uptodate > 0: log.info("  Up-To-Date: " + str(self.data_already_uptodate))
+            if self.data_skipped > 0: log.info("  Skipped: " + str(self.data_skipped))
+            if self.data_errors > 0: log.info("  Errors: " + str(self.data_errors))
+            log.info("  Total submodules: " + str(self.data_total))
+
+        if self.display_timing_total_only:
+            self.timing.print_total()
+        else:
+            self.timing.print()
+
+
+    def __locate_git_directory(self):
+        '''Initializes git_root based on os.getcwd.'''
+        try:
+            import git
+            cwd = os.getcwd()
+            log.debug("cwd = " + cwd.replace('\\', '/'))
+            git_repo = git.Repo(cwd, search_parent_directories=True)
+            git_root = git_repo.git.rev_parse("--show-toplevel")
+            self.git_root = git_root
+            log.debug("git root = " + self.git_root)
+        except git.exc.InvalidGitRepositoryError:
+            log.critical("fatal: not a git repository (or any of the parent directories): .git")
+            self.status = STATUS.not_git_repo
+            return False
+        except:
+            log.critical("ERROR: unknown error occured in GitSubmoduleUpdate:init\n")
+            self.status = STATUS.unknown
+            return False
+        self.initialized = True
+        return True
+
+
+    def __gitdir(self, path):
+        '''Get the --git-dir flag for a given path to a .git folder'''
+        return '--git-dir=' + path + '/.git'
+
+
+    def __recursive_update(self, git_root):
+        '''Function called to recursively update directories.'''
+        to_update, to_init = self.__get_modules_to_update(git_root)
+        if self.threads > 1:
+            for data in to_init: self.executor.submit(self.__init_dir, *data)
+            for data in to_update: self.executor.submit(self.__update_dir, *data)
+        else:
+            for data in to_init: self.__init_dir(*data)
+            for data in to_update: self.__update_dir(*data)
+
+
+    def __get_modules_to_update(self, git_root):
+        '''Get modules in git_root. Returns to_update, to_init lists.'''
+        all_files = subprocess.check_output(['git', self.__gitdir(git_root), 'ls-files', '--stage']).decode().splitlines()
+        modules = [ m for m in all_files if m.startswith("160000") ]  # magic number indicating submodule
+        self.data_total += len(modules)
+        to_update = []
+        to_init = []
+        unmerged = set()
+        for line in modules:
+            _, target_hash, stage, path = line.split()
+            abspath = os.path.join(self.git_root, path).replace('\\', '/')
+
+            # Check for initialization. For now, leave that operation to the standard git submodule script
+            if not os.path.exists(os.path.join(abspath, '.git')):
+                to_init.append((git_root, path, abspath, target_hash))
+                continue
+
+            # Check for unmerged submodules.
+            if int(stage) != 0:
+                self.data_skipped = self.data_skipped + 1
+                self.status = STATUS.unmerged_changes
+                if path not in unmerged:
+                    unmerged.add(path)
+                    log.warning( "Skipping unmerged submodule %s" % (path) )
+                continue
+            to_update.append((path, abspath, target_hash))
+        return to_update, to_init
+
+
+    def __init_dir(self, git_root, path, abspath, target_hash):
+        '''Initializes a git dir via builtin git submodule update --init, then runs __update_dir on the dir'''
+        if self.init:
+            self.data_initialized = self.data_initialized + 1
+            self.timing.start('init ' + path)
+            if not self.noexec:
+                subprocess.check_call(["git", self.__gitdir(git_root), "submodule", "update", "--init", path])
+            self.timing.end('init ' + path)
+            self.__update_dir(path, abspath, target_hash)
+        else:
+            self.status = STATUS.not_initialized
+            self.data_skipped = self.data_skipped + 1
+            log.warning( "Unable to checkout '%s' in submodule path '%s'\nThis submodule has not been initialized. Use the '--init' flag to initialize." % (target_hash, path) )
+
+
+    def __update_dir(self, path, abspath, target_hash):
+        '''Checks out a path to the target_hash if it isnt up-to-date.'''
+        self.timing.start(path)
+        if self.exiting: return
+        current_hash = subprocess.check_output(["git", self.__gitdir(abspath), 'rev-parse', 'HEAD']).decode().rstrip()
+        if current_hash != target_hash:
+            try:
+                if self.exiting: return
+                if not self.noexec:
+                    subprocess.check_call(["git", self.__gitdir(abspath), "checkout", "-q", target_hash])
+                log.info( "Submodule path '%s': checked out '%s'" % (path, target_hash) )
+                if self.exiting: return
+                if self.recursive:
+                    self.__recursive_update(abspath)
+                self.data_updated = self.data_updated + 1
+            except subprocess.CalledProcessError:
+                self.data_errors = self.data_errors + 1
+                self.status = STATUS.unable_to_checkout
+                log.warning( "Unable to checkout '%s' in submodule path '%s'" % (target_hash, path) )
+        else:
+            log.debug( "Found up-to-date submodule: %s" % (path) )
+            self.data_already_uptodate = self.data_already_uptodate + 1
+        self.timing.end(path)
+
+
+def main():
+    parser = argparse.ArgumentParser('git submodule update', description='Faster git submodule update')
+    arg_group_flags = parser.add_argument_group("FLAGS")
+    arg_group_flags.add_argument('--init', help='Initialize git submodules', action='store_true')
+    arg_group_flags.add_argument('--recursive', help='Update submodules recursively', action='store_true')
+    arg_group_flags.add_argument('--time', help='Print timing data', action='store_true')
+    arg_group_flags.add_argument('-t', '--time_total', help='Print timing data', action='store_true')
+    arg_group_flags.add_argument('--results', help='Print results data', action='store_true')
+    arg_group_flags.add_argument('--debug', help='Verbose logging', action=GitSubmoduleUpdateLogging.ArgparseAction)
+    arg_group_flags.add_argument('-n', '--noexec', help='Dont checkout any submodules', action='store_true')
+    arg_group_flags.add_argument('-j', '--threads', help='Number of threads to use. Default: ' + str((os.cpu_count() or 1)) + ' threads.', type=int, action='store', default=(os.cpu_count() or 1))
+    args = parser.parse_args()
+    GitSubmoduleUpdateLogging(args.debug)
+    sup = GitSubmoduleUpdate(args)
+    sup.setup()
+    if sup.status == STATUS.success:
+        sup.run()
+    return sup.status.value
+
+
+if __name__ == "__main__":
+    sys.exit(main())
