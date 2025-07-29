@@ -4,25 +4,48 @@
 # @Author:   Ben Sokol
 # @Email:    ben@bensokol.com
 #
-# Copyright (C) 2019 by Ben Sokol. All Rights Reserved.
+# Copyright (C) 2025 by Ben Sokol. All Rights Reserved.
 
 import argparse
 import enum
 import logging
 import os
+import pathlib
 import subprocess
 import sys
+import threading
+
+
+if sys.version_info[:3] >= (3,11,0):
+    @enum.verify(enum.NAMED_FLAGS)
+    @enum.unique
+    class STATUS(enum.IntFlag, boundary=enum.STRICT):
+        success = 0
+        not_git_repo = enum.auto()
+        unmerged_changes = enum.auto()
+        not_initialized = enum.auto()
+        unable_to_checkout = enum.auto()
+        git_python_not_installed = enum.auto()
+else:
+    class STATUS(enum.IntFlag):
+        success = 0
+        not_git_repo = enum.auto()
+        unmerged_changes = enum.auto()
+        not_initialized = enum.auto()
+        unable_to_checkout = enum.auto()
+        git_python_not_installed = enum.auto()
+
+
+try:
+    import git
+except ImportError as e:
+    print(e.msg)
+    print("Try: `pip install GitPython` (may require sudo)")
+    print("See: https://pypi.org/project/GitPython")
+    sys.exit(STATUS.git_python_not_installed)
+
 
 log = None
-
-class STATUS(enum.Enum):
-    success = 0
-    not_git_repo = 1
-    unmerged_changes = 2
-    not_initialized = 3
-    unable_to_checkout = 4
-    unknown = 100
-
 
 class GitSubmoduleUpdateLogging():
     class ArgparseAction(argparse._StoreConstAction):
@@ -67,25 +90,11 @@ class Timing():
         self.enabled = enabled
         self.times = {}
         self.total_name = total_name
-        import time
-        self.module_time = time
+        self.module_time = None
         self.module_datetime = None
 
-    def start(self, name):
-        if self.enabled:
-            self.times[name] = {}
-            self.times[name]['start'] = self.module_time.time()
-
-    def end(self, name):
-        if self.enabled:
-            if name not in self.times:
-                raise RuntimeError(name + " is not in self.times.")
-            self.times[name]['end'] = self.module_time.time()
-
     def __format(self, start, end, dec=2):
-        if self.module_datetime is None:
-            import datetime
-            self.module_datetime = datetime
+        self.enable()
         ret = ""
         seconds = round(self.module_datetime.timedelta(seconds=(end - start)).total_seconds(), dec)
         struct = self.module_time.gmtime(seconds)
@@ -100,6 +109,28 @@ class Timing():
             ret += "s, " if struct.tm_min > 1 else ", "
         ret += str(seconds).ljust(4, "0") + " seconds"
         return ret
+
+    def enable(self):
+        if self.module_time is None:
+            import time
+            self.module_time = time
+
+        if self.module_datetime is None:
+            import datetime
+            self.module_datetime = datetime
+
+    def start(self, name):
+        if self.enabled:
+            self.enable()
+            self.times[name] = {}
+            self.times[name]['start'] = self.module_time.time()
+
+    def end(self, name):
+        if self.enabled:
+            self.enable()
+            if name not in self.times:
+                raise RuntimeError(name + " is not in self.times.")
+            self.times[name]['end'] = self.module_time.time()
 
     def print(self, newline_before_total=True):
         if self.enabled:
@@ -127,7 +158,7 @@ class Timing():
                     log.info("")
                 log.info("  Total: " + self.__format(root_start, root_end))
 
-    def print_total(self):
+    def get_total(self):
         if self.enabled:
             root_start = None
             root_end = None
@@ -140,7 +171,13 @@ class Timing():
                     root_start = data['start']
                     root_end = data['end']
                     break
-            log.info("Time: " + self.__format(root_start, root_end))
+            return self.__format(root_start, root_end)
+        else:
+            return ""
+
+    def print_total(self):
+        if self.enabled:
+            log.info("Time: " + self.get_total())
 
 
 class GitSubmoduleUpdate():
@@ -151,7 +188,7 @@ class GitSubmoduleUpdate():
         self.display_timing_total_only = args.time_total
         self.noexec = args.noexec
         self.threads = args.threads
-        self.results = args.results
+        self.results = not args.no_results
 
         log.debug("Using " + str(self.threads) + " threads.")
         self.status = STATUS.success
@@ -162,25 +199,49 @@ class GitSubmoduleUpdate():
             import concurrent.futures
             self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.threads)
 
+
+        self.data_lock = threading.Lock()
+
         self.data_total = 0
         self.data_updated = 0
         self.data_already_uptodate = 0
         self.data_initialized = 0
         self.data_skipped = 0
         self.data_errors = 0
+        self.data_init_errors = 0
+
+    def update_data(self, status = None, data_total = None, data_updated = None, data_already_uptodate = None, data_initialized = None, data_skipped = None, data_errors = None, data_init_errors = None):
+        with self.data_lock:
+            if status is not None:
+                self.status = self.status | status
+            if data_total is not None:
+                self.data_total = self.data_total + data_total
+            if data_updated is not None:
+                self.data_updated = self.data_updated + data_updated
+            if data_already_uptodate is not None:
+                self.data_already_uptodate = self.data_already_uptodate + data_already_uptodate
+            if data_initialized is not None:
+                self.data_initialized = self.data_initialized + data_initialized
+            if data_skipped is not None:
+                self.data_skipped = self.data_skipped + data_skipped
+            if data_errors is not None:
+                self.data_errors = self.data_errors + data_errors
+            if data_init_errors is not None:
+                self.data_init_errors = self.data_init_errors + data_init_errors
 
 
     def __del__(self):
         try:
             self.executor.shutdown()
         except:
-            self.status = STATUS.unkown
+            self.status = STATUS.unknown
 
 
     def setup(self):
         '''Setup. Call before run.'''
         self.__locate_git_directory()
-        self.timing = Timing(enabled=self.display_timing or self.display_timing_total_only, total_name=self.git_root)
+        if self.status is STATUS.success:
+            self.timing = Timing(enabled=self.display_timing or self.display_timing_total_only, total_name=self.git_root)
         return self.status == STATUS.success
 
 
@@ -190,12 +251,7 @@ class GitSubmoduleUpdate():
         if not self.initialized:
             raise RuntimeError("setup must be complete before run is called.")
 
-        if self.init:
-            self.timing.start('init all')
-            if not self.noexec:
-                subprocess.check_call(["git", "submodule", "init"])
-            self.timing.end('init all')
-
+        # Run requested git submodule command (--init and/or --recursive) with timing if requested
         self.timing.start(self.git_root)
         try:
             self.__recursive_update(self.git_root)
@@ -207,15 +263,21 @@ class GitSubmoduleUpdate():
 
         log.debug("Finished GitSubmoduleUpdate")
         if self.results:
-            log.info("Results:")
+            if self.timing.enabled:
+                log.info("Results (" + self.timing.get_total() + "): ")
+            else:
+                log.info("Results:")
             if self.data_updated > 0: log.info("  Updated: " + str(self.data_updated))
             if self.data_already_uptodate > 0: log.info("  Up-To-Date: " + str(self.data_already_uptodate))
+            if self.data_initialized > 0: log.info("  Initialized: " + str(self.data_initialized))
             if self.data_skipped > 0: log.info("  Skipped: " + str(self.data_skipped))
             if self.data_errors > 0: log.info("  Errors: " + str(self.data_errors))
+            if self.data_init_errors > 0: log.info("  Init Errors: " + str(self.data_init_errors))
             log.info("  Total submodules: " + str(self.data_total))
 
         if self.display_timing_total_only:
-            self.timing.print_total()
+            if not self.results:
+                self.timing.print_total()
         else:
             self.timing.print()
 
@@ -223,7 +285,6 @@ class GitSubmoduleUpdate():
     def __locate_git_directory(self):
         '''Initializes git_root based on os.getcwd.'''
         try:
-            import git
             cwd = os.getcwd()
             log.debug("cwd = " + cwd.replace('\\', '/'))
             git_repo = git.Repo(cwd, search_parent_directories=True)
@@ -250,11 +311,14 @@ class GitSubmoduleUpdate():
     def __recursive_update(self, git_root):
         '''Function called to recursively update directories.'''
         to_update, to_init = self.__get_modules_to_update(git_root)
+
+        # Alwaus run init in single thread to prevent collisions in .git/config
+        # __init_dir() will attempt to run the actual update command in executor
+        for data in to_init: self.__init_dir(*data)
+
         if self.threads > 1:
-            for data in to_init: self.executor.submit(self.__init_dir, *data)
             for data in to_update: self.executor.submit(self.__update_dir, *data)
         else:
-            for data in to_init: self.__init_dir(*data)
             for data in to_update: self.__update_dir(*data)
 
 
@@ -262,7 +326,7 @@ class GitSubmoduleUpdate():
         '''Get modules in git_root. Returns to_update, to_init lists.'''
         all_files = subprocess.check_output(['git', self.__gitdir(git_root), 'ls-files', '--stage']).decode().splitlines()
         modules = [ m for m in all_files if m.startswith("160000") ]  # magic number indicating submodule
-        self.data_total += len(modules)
+        self.update_data(data_total=len(modules))
         to_update = []
         to_init = []
         unmerged = set()
@@ -277,7 +341,7 @@ class GitSubmoduleUpdate():
 
             # Check for unmerged submodules.
             if int(stage) != 0:
-                self.data_skipped = self.data_skipped + 1
+                self.update_data(data_skipped=1)
                 self.status = STATUS.unmerged_changes
                 if path not in unmerged:
                     unmerged.add(path)
@@ -288,18 +352,32 @@ class GitSubmoduleUpdate():
 
 
     def __init_dir(self, git_root, path, abspath, target_hash):
-        '''Initializes a git dir via builtin git submodule update --init, then runs __update_dir on the dir'''
+        '''Initializes a git dir via builtin git submodule init, then runs __init_update_dir on the dir'''
         if self.init:
-            self.data_initialized = self.data_initialized + 1
+            self.update_data(data_initialized=1)
             self.timing.start('init ' + path)
             if not self.noexec:
-                subprocess.check_call(["git", self.__gitdir(git_root), "submodule", "update", "--init", path])
-            self.timing.end('init ' + path)
-            self.__update_dir(path, abspath, target_hash)
+                ret = subprocess.check_call(["git", self.__gitdir(git_root), "submodule", "init", path])
+                if ret != 0:
+                    self.update_data(data_init_errors=1)
+
+            if self.threads > 1:
+                self.executor.submit(self.__init_update_dir, git_root, path)
+            else:
+                self.__init_update_dir(git_root, path)
         else:
             self.status = STATUS.not_initialized
-            self.data_skipped = self.data_skipped + 1
-            log.warning( "Unable to checkout '%s' in submodule path '%s'\nThis submodule has not been initialized. Use the '--init' flag to initialize." % (target_hash, path) )
+            self.update_data(data_skipped=1)
+            log.warning( "Unable to checkout '%s' in submodule path '%s'\nThis submodule has not been initialized. Use the '--init' flag to initialize." % (git_root, path) )
+
+
+    def __init_update_dir(self, git_root, path):
+        '''Initializes a git dir via builtin git submodule update --init, then runs __update_dir on the dir'''
+        if not self.noexec:
+            ret = subprocess.check_call(["git", self.__gitdir(git_root), "submodule", "update", "--init", path])
+            if ret != 0:
+                self.update_data(data_init_errors=1)
+        self.timing.end('init ' + path)
 
 
     def __update_dir(self, path, abspath, target_hash):
@@ -316,27 +394,35 @@ class GitSubmoduleUpdate():
                 if self.exiting: return
                 if self.recursive:
                     self.__recursive_update(abspath)
-                self.data_updated = self.data_updated + 1
+                self.update_data(data_updated=1)
             except subprocess.CalledProcessError:
-                self.data_errors = self.data_errors + 1
+                self.update_data(data_errors=1)
                 self.status = STATUS.unable_to_checkout
                 log.warning( "Unable to checkout '%s' in submodule path '%s'" % (target_hash, path) )
         else:
-            log.debug( "Found up-to-date submodule: %s" % (path) )
-            self.data_already_uptodate = self.data_already_uptodate + 1
+            self.update_data(data_already_uptodate=1)
         self.timing.end(path)
 
 
 def main():
-    parser = argparse.ArgumentParser('git submodule update', description='Faster git submodule update')
+    git_exec_path = subprocess.run(['git', '--exec-path'], stdout=subprocess.PIPE)
+    parser = argparse.ArgumentParser(
+        prog='git submodule update',
+        description='  Faster git submodule update with init and recursive capabilities.\n  By default this runs multi-threaded up to the number of threads available.',
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog='Recommended:\n'
+             + '  Install: `ln -s "' + str(pathlib.Path(__file__).resolve()) + '" "' + str(git_exec_path.stdout.decode('ascii')).strip('\n') + '/"`\n'
+             + '  Add git alias: `git config --global alias.sup \'submodule-fast-update --init --recursive\'\n\n'
+             + 'Examples (assumes the git alias above is setup):\n'
+             + '  Initialize and recursively update git submodules:\n\t`git sup')
     arg_group_flags = parser.add_argument_group("FLAGS")
     arg_group_flags.add_argument('--init', help='Initialize git submodules', action='store_true')
     arg_group_flags.add_argument('--recursive', help='Update submodules recursively', action='store_true')
-    arg_group_flags.add_argument('--time', help='Print timing data', action='store_true')
-    arg_group_flags.add_argument('-t', '--time_total', help='Print timing data', action='store_true')
-    arg_group_flags.add_argument('--results', help='Print results data', action='store_true')
+    arg_group_flags.add_argument('--time', help='Print timing data per submodule', action='store_true')
+    arg_group_flags.add_argument('-t', '--time_total', help='Print total timing data', action='store_true')
+    arg_group_flags.add_argument('--no-results', help='Dont print results data', action='store_true')
     arg_group_flags.add_argument('--debug', help='Verbose logging', action=GitSubmoduleUpdateLogging.ArgparseAction)
-    arg_group_flags.add_argument('-n', '--noexec', help='Dont checkout any submodules', action='store_true')
+    arg_group_flags.add_argument('-n', '--noexec', help='No Execute. Do not checkout submodules', action='store_true')
     arg_group_flags.add_argument('-j', '--threads', help='Number of threads to use. Default: ' + str((os.cpu_count() or 1)) + ' threads.', type=int, action='store', default=(os.cpu_count() or 1))
     args = parser.parse_args()
     GitSubmoduleUpdateLogging(args.debug)
